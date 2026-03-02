@@ -31,7 +31,7 @@ import socket
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
 from threading import Lock
@@ -117,45 +117,64 @@ def classify(target: str) -> str:
     return "unknown"
 
 
+def _level_from_score(score: int) -> str:
+    """Map a 0-100 score to a risk level string."""
+    if score >= 80: return "CRITICAL"
+    if score >= 60: return "HIGH"
+    if score >= 35: return "MEDIUM"
+    if score >= 10: return "LOW"
+    return "INFO"
+
+
+def _cred_score(count: int) -> int:
+    """Normalise a compromised credential count to a 0-100 exposure score."""
+    if count >= 10_000: return 100
+    if count >= 1_000:  return 75
+    if count >= 100:    return 50
+    if count > 0:       return 25
+    return 0
+
+
 def calc_risk(
     ports:      List[int],
-    cves:       List[str],
+    cves:       Dict[str, float],   # {CVE_ID: CVSS_score}
     cred_count: int = 0,
-) -> Tuple[int, str]:
+) -> Dict:
     """
-    Return (score 0-100, level string) combining attack surface,
-    CVE severity, and credential breach exposure.
+    Return a risk dict with composite score/level and two-dimensional breakdown.
 
-    Scoring weights:
+    Attack Surface (ports + CVEs):
       CRITICAL_PORT exposed  : +30 each
       HIGH_RISK_PORT exposed : +15 each
       Other open port        : +3  each
-      Known CVE              : +25 each
-      Credential exposure    : +5 / +10 / +20 / +30 (tiered by count)
+      CVE                    : round(min(cvss * 2.5, 25)) — CVSS-weighted
+
+    Credential Exposure (HackedList infostealer data):
+      Normalised to 0-100 via _cred_score().
+      Contributes up to 50 bonus points to the composite score.
+
+    Composite: min(attack_surface_score + credential_score // 2, 100)
     """
-    score = sum(
+    port_score = sum(
         30 if p in CRITICAL_PORTS else 15 if p in HIGH_RISK_PORTS else 3
         for p in ports
-    ) + len(cves) * 25
-
-    # Tiered risk boost from compromised credential count (infostealer data)
-    if cred_count >= 10_000:
-        score += 30
-    elif cred_count >= 1_000:
-        score += 20
-    elif cred_count >= 100:
-        score += 10
-    elif cred_count > 0:
-        score += 5
-
-    score = min(score, 100)
-    level = (
-        "CRITICAL" if score >= 80 else
-        "HIGH"     if score >= 60 else
-        "MEDIUM"   if score >= 35 else
-        "LOW"      if score >= 10 else "INFO"
     )
-    return score, level
+    # CVSS-weighted CVE scoring: CVSS 10.0 → 25pts, CVSS 7.5 → 19pts, CVSS 3.0 → 8pts
+    cve_score  = sum(round(min(cvss * 2.5, 25)) for cvss in cves.values())
+    as_score   = min(port_score + cve_score, 100)
+
+    # Credential exposure: normalised 0-100, contributes up to 50% bonus
+    ce_score   = _cred_score(cred_count)
+    comp_score = min(as_score + ce_score // 2, 100)
+
+    return {
+        "score":                comp_score,                      # composite (backward compat)
+        "level":                _level_from_score(comp_score),
+        "attack_surface_score": as_score,
+        "attack_surface_level": _level_from_score(as_score),
+        "credential_score":     ce_score,
+        "credential_level":     _level_from_score(ce_score),
+    }
 
 
 # ── Rate limiter (token-bucket, thread-safe) ───────────────────────────────────
@@ -204,14 +223,14 @@ class ScanCache:
             if entry is None:
                 return None
             ts, data = entry
-            if datetime.utcnow() - ts < self._ttl:
+            if datetime.now(timezone.utc) - ts < self._ttl:
                 return data
             del self._store[key]
             return None
 
     def put(self, key: str, data: Dict) -> None:
         with self._lock:
-            self._store[key] = (datetime.utcnow(), data)
+            self._store[key] = (datetime.now(timezone.utc), data)
 
     def clear(self) -> None:
         with self._lock:
@@ -254,13 +273,14 @@ def retry(
                         code, func.__qualname__, attempt + 1, max_attempts, wait,
                     )
                     time.sleep(wait)
-                except requests.Timeout:
+                except (requests.Timeout, requests.ConnectionError) as exc:
                     if attempt == max_attempts - 1:
                         raise
                     wait = base_delay * (2 ** attempt)
                     log.warning(
-                        "Timeout in %s (attempt %d/%d) — retrying in %.0fs",
-                        func.__qualname__, attempt + 1, max_attempts, wait,
+                        "%s in %s (attempt %d/%d) — retrying in %.0fs",
+                        type(exc).__name__, func.__qualname__,
+                        attempt + 1, max_attempts, wait,
                     )
                     time.sleep(wait)
         return wrapper
@@ -305,7 +325,11 @@ class ShodanClient:
 def parse_shodan(raw: Dict) -> Dict:
     """Parse a raw Shodan /shodan/host/{ip} response into a normalised dict."""
     ports = sorted(raw.get("ports", []))
-    vulns = sorted(raw.get("vulns", {}).keys())
+    # Preserve CVSS scores for weighted risk calculation; default to 5.0 if absent
+    vulns: Dict[str, float] = {
+        cve_id: float((v.get("cvss") if isinstance(v, dict) else v) or 5.0)
+        for cve_id, v in raw.get("vulns", {}).items()
+    }
 
     services: List[str] = []
     for item in raw.get("data", [])[:10]:
@@ -445,7 +469,10 @@ def parse_hackedlist(raw: Dict) -> Dict:
     Handles both ``total`` and ``count`` field names for flexibility
     across different API versions.
     """
-    total = int(raw.get("total", raw.get("count", 0)) or 0)
+    try:
+        total = int(raw.get("total", raw.get("count", 0)) or 0)
+    except (ValueError, TypeError):
+        total = 0
 
     sources = raw.get("sources", raw.get("infostealers", []))
     if isinstance(sources, str):
@@ -564,7 +591,7 @@ class OSINTScout:
             "target":     target,
             "type":       target_type,
             "ip":         None,
-            "timestamp":  datetime.utcnow().isoformat() + "Z",
+            "timestamp":  datetime.now(timezone.utc).isoformat(),
             "shodan":     None,
             "censys":     None,
             "hackedlist": None,
@@ -579,9 +606,9 @@ class OSINTScout:
         ip = self._resolve(target) if target_type == "domain" else target
         record["ip"] = ip if ip != target else None
 
-        all_ports:  List[int] = []
-        all_cves:   List[str] = []
-        cred_count: int       = 0
+        all_ports:  List[int]         = []
+        all_cves:   Dict[str, float]  = {}   # {CVE_ID: CVSS_score}
+        cred_count: int               = 0
 
         # ── Concurrent source queries ──────────────────────────────────────────
         task_map: Dict[str, object] = {}
@@ -600,7 +627,7 @@ class OSINTScout:
                     record[key] = data
                     if key == "shodan":
                         all_ports.extend(data.get("ports", []))
-                        all_cves.extend(data.get("cves", []))
+                        all_cves.update(data.get("cves", {}))
                     elif key == "censys":
                         all_ports.extend(data.get("ports", []))
                     elif key == "hackedlist":
@@ -611,16 +638,15 @@ class OSINTScout:
 
         # ── Risk scoring ───────────────────────────────────────────────────────
         unique_ports = sorted(set(all_ports))
-        unique_cves  = sorted(set(all_cves))
-        score, level = calc_risk(unique_ports, unique_cves, cred_count)
+        risk         = calc_risk(unique_ports, all_cves, cred_count)
 
-        record["risk"]    = {"score": score, "level": level}
+        record["risk"]    = risk
         record["summary"] = {
             "unique_ports":        unique_ports,
             "total_open_ports":    len(unique_ports),
             "high_risk_ports":     [p for p in unique_ports if p in HIGH_RISK_PORTS],
             "critical_ports":      [p for p in unique_ports if p in CRITICAL_PORTS],
-            "cves":                unique_cves,
+            "cves":                sorted(all_cves.keys()),
             "credential_exposure": cred_count,
         }
 
@@ -770,8 +796,12 @@ def render_hackedlist(data: Optional[Dict]) -> Optional[Table]:
 
 
 def render_risk(risk: Dict, summary: Dict) -> None:
-    score      = risk.get("score", 0)
-    level      = risk.get("level", "INFO")
+    score    = risk.get("score", 0)
+    level    = risk.get("level", "INFO")
+    as_score = risk.get("attack_surface_score", 0)
+    as_level = risk.get("attack_surface_level", "INFO")
+    ce_score = risk.get("credential_score", 0)
+    ce_level = risk.get("credential_level", "INFO")
     color      = RISK_COLORS.get(level, "white")
     bar_filled = int(score / 5)
     bar        = "█" * bar_filled + "░" * (20 - bar_filled)
@@ -787,6 +817,19 @@ def render_risk(risk: Dict, summary: Dict) -> None:
     content.append(f"{score:>3}/100  [{bar}]\n", style=f"bold {color}")
     content.append("  Level   :  ", style="bold white")
     content.append(f"{level}\n", style=f"bold {color}")
+
+    # Two-dimensional breakdown
+    as_color = RISK_COLORS.get(as_level, "white")
+    content.append("  Surface :  ", style="bold white")
+    content.append(f"{as_score}/100  ", style=as_color)
+    content.append(f"[{as_level}]\n", style=f"dim {as_color}")
+
+    if ce_score > 0:
+        ce_color = RISK_COLORS.get(ce_level, "white")
+        content.append("  Cred    :  ", style="bold white")
+        content.append(f"{ce_score}/100  ", style=ce_color)
+        content.append(f"[{ce_level}]\n", style=f"dim {ce_color}")
+
     content.append("  Ports   :  ", style="bold white")
     content.append(f"{total} open\n")
 

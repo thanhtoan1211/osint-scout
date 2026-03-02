@@ -1,9 +1,9 @@
 """
 OSINT Scout — Test Suite
 ========================
-Tests cover: classify, calc_risk (incl. credential risk), RateLimiter,
-ScanCache, parse_shodan, parse_censys, parse_hackedlist, and
-OSINTScout.scan() with mocked HTTP.
+Tests cover: classify, calc_risk (incl. credential risk + CVSS weighting),
+RateLimiter, ScanCache, retry decorator, parse_shodan, parse_censys,
+parse_hackedlist, OSINTScout.scan() / _resolve() with mocked HTTP.
 
 Run:
     pip install pytest
@@ -15,9 +15,10 @@ import time
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock
 
 import pytest
+import requests
 
 # ── ensure scout is importable from parent directory ──────────────────────────
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -25,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from scout import (
     classify,
     calc_risk,
+    retry,
     RateLimiter,
     ScanCache,
     parse_shodan,
@@ -265,116 +267,143 @@ class TestClassify:
 class TestCalcRisk:
 
     def test_no_ports_no_cves(self):
-        score, level = calc_risk([], [])
-        assert score == 0
-        assert level == "INFO"
+        risk = calc_risk([], {})
+        assert risk["score"] == 0
+        assert risk["level"] == "INFO"
 
     def test_single_low_port(self):
         # Port 8888 is not in HIGH_RISK or CRITICAL → +3
-        score, level = calc_risk([8888], [])
-        assert score == 3
-        assert level == "INFO"
+        risk = calc_risk([8888], {})
+        assert risk["score"] == 3
+        assert risk["level"] == "INFO"
 
     def test_single_high_risk_port(self):
         # SSH (22) → +15
-        score, level = calc_risk([22], [])
-        assert score == 15
-        assert level == "LOW"
+        risk = calc_risk([22], {})
+        assert risk["score"] == 15
+        assert risk["level"] == "LOW"
 
     def test_single_critical_port(self):
         # RDP (3389) → +30 → LOW range (10-34)
-        score, level = calc_risk([3389], [])
-        assert score == 30
-        assert level == "LOW"
+        risk = calc_risk([3389], {})
+        assert risk["score"] == 30
+        assert risk["level"] == "LOW"
 
     def test_two_critical_ports(self):
         # 3389 + 445 → 60
-        score, level = calc_risk([3389, 445], [])
-        assert score == 60
-        assert level == "HIGH"
+        risk = calc_risk([3389, 445], {})
+        assert risk["score"] == 60
+        assert risk["level"] == "HIGH"
 
     def test_three_critical_ports(self):
         # 3389 + 445 + 6379 → 90 (capped at 100)
-        score, level = calc_risk([3389, 445, 6379], [])
-        assert score == 90
-        assert level == "CRITICAL"
+        risk = calc_risk([3389, 445, 6379], {})
+        assert risk["score"] == 90
+        assert risk["level"] == "CRITICAL"
 
     def test_cve_only(self):
-        # 2 CVEs → 50
-        score, level = calc_risk([], ["CVE-2021-44228", "CVE-2022-0778"])
-        assert score == 50
-        assert level == "MEDIUM"
+        # CVSS 10.0 → round(min(25, 25)) = 25
+        # CVSS  7.5 → round(min(18.75, 25)) = 19
+        # total cve_score = 44, comp = 44 → MEDIUM
+        risk = calc_risk([], {"CVE-2021-44228": 10.0, "CVE-2022-0778": 7.5})
+        assert risk["score"] == 44
+        assert risk["level"] == "MEDIUM"
 
     def test_mixed_critical_and_cves(self):
-        # 3389 (30) + 2 CVEs (50) = 80 → CRITICAL
-        score, level = calc_risk([3389], ["CVE-2021-44228", "CVE-2022-0778"])
-        assert score == 80
-        assert level == "CRITICAL"
+        # 3389(30) + CVSS 10.0(25) + CVSS 7.5(19) = 74 → HIGH
+        risk = calc_risk([3389], {"CVE-2021-44228": 10.0, "CVE-2022-0778": 7.5})
+        assert risk["score"] == 74
+        assert risk["level"] == "HIGH"
 
     def test_score_capped_at_100(self):
         # Many critical ports + many CVEs → must never exceed 100
         ports = list(CRITICAL_PORTS)
-        cves  = [f"CVE-2024-{i:04d}" for i in range(10)]
-        score, _ = calc_risk(ports, cves)
-        assert score == 100
+        cves  = {f"CVE-2024-{i:04d}": 9.0 for i in range(10)}
+        risk  = calc_risk(ports, cves)
+        assert risk["score"] == 100
 
     def test_http_https_not_counted_as_high_risk(self):
         # 80 and 443 are NOT in HIGH_RISK_PORTS → only +3 each
-        score, level = calc_risk([80, 443], [])
-        assert score == 6
-        assert level == "INFO"
+        risk = calc_risk([80, 443], {})
+        assert risk["score"] == 6
+        assert risk["level"] == "INFO"
 
     def test_level_boundaries(self):
         # Exact boundary checks
-        assert calc_risk([], [])[1]   == "INFO"   # 0
-        assert calc_risk([22], [])[1] == "LOW"    # 15
-        # MEDIUM boundary: score 35
-        score, level = calc_risk([22, 100, 101, 102, 103, 104, 105, 106], [])
-        assert level == "MEDIUM"
+        assert calc_risk([], {})["level"]   == "INFO"   # 0
+        assert calc_risk([22], {})["level"] == "LOW"    # 15
+        # MEDIUM boundary: score 36 (15 + 7×3 = 36)
+        risk = calc_risk([22, 100, 101, 102, 103, 104, 105, 106], {})
+        assert risk["level"] == "MEDIUM"
 
     # ── Credential exposure (cred_count parameter) ─────────────────────────────
 
     def test_zero_credentials_no_extra_risk(self):
         # Default cred_count=0 has no effect
-        score, level = calc_risk([], [], cred_count=0)
-        assert score == 0
-        assert level == "INFO"
+        risk = calc_risk([], {}, cred_count=0)
+        assert risk["score"] == 0
+        assert risk["level"] == "INFO"
 
     def test_few_credentials_adds_low_risk(self):
-        # 1-99 credentials → +5
-        score, level = calc_risk([], [], cred_count=50)
-        assert score == 5
-        assert level == "INFO"
+        # ce_score = 25, comp = 0 + 25//2 = 12 → LOW
+        risk = calc_risk([], {}, cred_count=50)
+        assert risk["score"] == 12
+        assert risk["level"] == "LOW"
 
     def test_medium_credential_exposure(self):
-        # 100-999 → +10
-        score, level = calc_risk([], [], cred_count=500)
-        assert score == 10
-        assert level == "LOW"
+        # ce_score = 50, comp = 0 + 50//2 = 25 → LOW
+        risk = calc_risk([], {}, cred_count=500)
+        assert risk["score"] == 25
+        assert risk["level"] == "LOW"
 
     def test_high_credential_exposure(self):
-        # 1000-9999 → +20
-        score, level = calc_risk([], [], cred_count=5_000)
-        assert score == 20
-        assert level == "LOW"
+        # ce_score = 75, comp = 0 + 75//2 = 37 → MEDIUM
+        risk = calc_risk([], {}, cred_count=5_000)
+        assert risk["score"] == 37
+        assert risk["level"] == "MEDIUM"
 
     def test_critical_credential_exposure(self):
-        # 10000+ → +30
-        score, level = calc_risk([], [], cred_count=15_000)
-        assert score == 30
-        assert level == "LOW"
+        # ce_score = 100, comp = 0 + 100//2 = 50 → MEDIUM
+        risk = calc_risk([], {}, cred_count=15_000)
+        assert risk["score"] == 50
+        assert risk["level"] == "MEDIUM"
 
     def test_credentials_combined_with_ports_boosts_level(self):
-        # SSH(15) + 1000 creds(+20) = 35 → MEDIUM
-        score, level = calc_risk([22], [], cred_count=1_000)
-        assert score == 35
-        assert level == "MEDIUM"
+        # SSH(as=15) + 1000 creds(ce=75): comp = 15 + 75//2 = 15+37 = 52 → MEDIUM
+        risk = calc_risk([22], {}, cred_count=1_000)
+        assert risk["score"] == 52
+        assert risk["level"] == "MEDIUM"
 
     def test_cred_count_cannot_exceed_100(self):
         # Massive credentials + dangerous ports must stay capped
         ports = list(CRITICAL_PORTS)
-        score, _ = calc_risk(ports, [], cred_count=50_000)
-        assert score == 100
+        risk  = calc_risk(ports, {}, cred_count=50_000)
+        assert risk["score"] == 100
+
+    def test_cvss_weighting_high_vs_low_cve(self):
+        """High CVSS CVE must contribute more risk than low CVSS CVE."""
+        risk_high = calc_risk([], {"CVE-A": 10.0})
+        risk_low  = calc_risk([], {"CVE-B": 3.0})
+        assert risk_high["attack_surface_score"] > risk_low["attack_surface_score"]
+        assert risk_high["attack_surface_score"] == 25  # round(min(25.0, 25)) = 25
+        assert risk_low["attack_surface_score"]  == 8   # round(min(7.5, 25))  = 8
+
+    def test_risk_dict_has_all_keys(self):
+        """calc_risk must return a dict with all expected breakdown keys."""
+        risk = calc_risk([22], {"CVE-A": 5.0}, cred_count=100)
+        for key in (
+            "score", "level",
+            "attack_surface_score", "attack_surface_level",
+            "credential_score",     "credential_level",
+        ):
+            assert key in risk
+
+    def test_attack_surface_and_credential_independent(self):
+        """attack_surface_score should be unaffected by credential count."""
+        risk_no_creds   = calc_risk([22], {"CVE-A": 8.0}, cred_count=0)
+        risk_with_creds = calc_risk([22], {"CVE-A": 8.0}, cred_count=5_000)
+        assert risk_no_creds["attack_surface_score"] == risk_with_creds["attack_surface_score"]
+        assert risk_with_creds["score"] > risk_no_creds["score"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -490,6 +519,62 @@ class TestScanCache:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TestRetry
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestRetry:
+
+    def test_retry_on_connection_error(self):
+        """ConnectionError should be retried up to max_attempts."""
+        call_count = 0
+
+        @retry(max_attempts=3, base_delay=0.01)
+        def flaky():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise requests.ConnectionError("Connection refused")
+            return "success"
+
+        assert flaky() == "success"
+        assert call_count == 3
+
+    def test_retry_on_503(self):
+        """HTTP 503 should be retried; call count equals max_attempts."""
+        call_count = 0
+
+        @retry(max_attempts=2, base_delay=0.01)
+        def always_503():
+            nonlocal call_count
+            call_count += 1
+            mock_resp = MagicMock()
+            mock_resp.status_code = 503
+            mock_resp.headers     = {}
+            raise requests.HTTPError(response=mock_resp)
+
+        with pytest.raises(requests.HTTPError):
+            always_503()
+        assert call_count == 2
+
+    def test_no_retry_on_401(self):
+        """HTTP 401 (auth failure) must NOT be retried — re-raised immediately."""
+        call_count = 0
+
+        @retry(max_attempts=3, base_delay=0.01)
+        def auth_fail():
+            nonlocal call_count
+            call_count += 1
+            mock_resp = MagicMock()
+            mock_resp.status_code = 401
+            mock_resp.headers     = {}
+            raise requests.HTTPError(response=mock_resp)
+
+        with pytest.raises(requests.HTTPError):
+            auth_fail()
+        assert call_count == 1  # no retry for 401
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TestParseShodan
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -501,7 +586,7 @@ class TestParseShodan:
 
     def test_clean_host_no_cves(self):
         result = parse_shodan(SHODAN_HOST_CLEAN)
-        assert result["cves"] == []
+        assert result["cves"] == {}
 
     def test_clean_host_org(self):
         result = parse_shodan(SHODAN_HOST_CLEAN)
@@ -515,6 +600,12 @@ class TestParseShodan:
         result = parse_shodan(SHODAN_HOST_MALICIOUS)
         assert "CVE-2021-44228" in result["cves"]
         assert "CVE-2022-0778"  in result["cves"]
+
+    def test_malicious_host_cve_cvss_values(self):
+        """CVEs must be a Dict[str, float] with correct CVSS scores."""
+        result = parse_shodan(SHODAN_HOST_MALICIOUS)
+        assert result["cves"]["CVE-2021-44228"] == 10.0
+        assert result["cves"]["CVE-2022-0778"]  == 7.5
 
     def test_malicious_host_ports(self):
         result = parse_shodan(SHODAN_HOST_MALICIOUS)
@@ -532,7 +623,7 @@ class TestParseShodan:
         assert result["country"] == "N/A"
         assert result["os"]      == "N/A"
         assert result["ports"]   == []
-        assert result["cves"]    == []
+        assert result["cves"]    == {}
 
     def test_ports_sorted(self):
         raw        = dict(SHODAN_HOST_CLEAN)
@@ -542,6 +633,12 @@ class TestParseShodan:
 
     def test_source_field(self):
         assert parse_shodan({})["source"] == "Shodan"
+
+    def test_cve_default_cvss_when_missing(self):
+        """CVEs without a cvss field should default to 5.0."""
+        raw = {"vulns": {"CVE-1234-5678": {}}}
+        result = parse_shodan(raw)
+        assert result["cves"]["CVE-1234-5678"] == 5.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -676,6 +773,13 @@ class TestParseHackedList:
         result = parse_hackedlist(raw)
         assert result["exposure_level"] == "HIGH"
 
+    def test_non_numeric_total_defaults_to_zero(self):
+        """Non-numeric 'total' field must not crash — defaults to 0."""
+        raw = {"domain": "broken.com", "total": "N/A"}
+        result = parse_hackedlist(raw)
+        assert result["total_credentials"] == 0
+        assert result["exposure_level"]    == "NONE"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TestOSINTScoutScan — integration tests with mocked HTTP
@@ -787,7 +891,7 @@ class TestOSINTScoutScan:
         assert result["ip"] == "8.8.8.8"
 
     def test_risk_score_critical_for_dangerous_ports(self):
-        """Scanning a host with RDP + Redis + 2 CVEs → CRITICAL risk."""
+        """Scanning a host with RDP + Redis + 2 CVEs (CVSS 10 + 7.5) → CRITICAL."""
         scout = _make_scout()
         scout._query_shodan     = MagicMock(
             return_value=parse_shodan(SHODAN_HOST_MALICIOUS)
@@ -797,8 +901,11 @@ class TestOSINTScoutScan:
 
         result = scout.scan("185.220.101.45")
 
+        # port_score = 3(443) + 30(3389) + 30(6379) = 63
+        # cve_score  = 25(CVSS10) + 19(CVSS7.5) = 44
+        # as_score   = min(107, 100) = 100 → capped
         assert result["risk"]["level"]      == "CRITICAL"
-        assert result["risk"]["score"]      == 100   # capped
+        assert result["risk"]["score"]      == 100
         assert 3389 in result["summary"]["critical_ports"]
         assert 6379 in result["summary"]["critical_ports"]
         assert "CVE-2021-44228" in result["summary"]["cves"]
@@ -811,10 +918,10 @@ class TestOSINTScoutScan:
         scout._query_censys     = MagicMock(return_value=parse_censys({}))
         scout._query_hackedlist = MagicMock(return_value=_HL_MOCK_EXPOSED)
 
-        # _HL_MOCK_EXPOSED has total_credentials=1500 → +20 to score
+        # _HL_MOCK_EXPOSED: total_credentials=1500 → ce_score=75, comp=0+37=37
         result = scout.scan("example.com")
 
-        assert result["risk"]["score"] >= 20
+        assert result["risk"]["score"] == 37
         assert result["summary"]["credential_exposure"] == 1_500
 
     def test_no_api_keys_scan_completes_without_crash(self):
@@ -858,6 +965,51 @@ class TestOSINTScoutScan:
 
         assert "credential_exposure" in result["summary"]
         assert result["summary"]["credential_exposure"] == 0
+
+    def test_risk_dict_has_two_dimensional_breakdown(self):
+        """result['risk'] must include both attack_surface and credential fields."""
+        scout = _make_scout()
+        scout._query_shodan     = MagicMock(return_value=parse_shodan(SHODAN_HOST_CLEAN))
+        scout._query_censys     = MagicMock(return_value=parse_censys(CENSYS_HOST))
+        scout._query_hackedlist = MagicMock()
+
+        result = scout.scan("8.8.8.8")
+
+        risk = result["risk"]
+        for key in ("score", "level", "attack_surface_score", "attack_surface_level",
+                    "credential_score", "credential_level"):
+            assert key in risk
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TestResolve
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestResolve:
+
+    def test_resolve_uses_system_dns_when_no_shodan(self):
+        """Without Shodan client, _resolve must fall back to socket.gethostbyname."""
+        from unittest.mock import patch
+        scout = _make_scout(shodan_key=None)
+        with patch("scout.socket.gethostbyname", return_value="93.184.216.34") as mock_dns:
+            result = scout._resolve("example.com")
+        mock_dns.assert_called_once_with("example.com")
+        assert result == "93.184.216.34"
+
+    def test_resolve_uses_shodan_dns_if_available(self):
+        """With Shodan available and responding, Shodan DNS takes priority."""
+        scout = _make_scout()
+        scout.shodan.resolve = MagicMock(return_value="8.8.8.8")
+        assert scout._resolve("google.com") == "8.8.8.8"
+
+    def test_resolve_falls_back_to_system_if_shodan_fails(self):
+        """If Shodan DNS raises, system resolver must be used as fallback."""
+        from unittest.mock import patch
+        scout = _make_scout()
+        scout.shodan.resolve = MagicMock(side_effect=Exception("Shodan API error"))
+        with patch("scout.socket.gethostbyname", return_value="1.2.3.4"):
+            result = scout._resolve("example.com")
+        assert result == "1.2.3.4"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
