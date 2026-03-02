@@ -1,0 +1,10 @@
+# OSINT Scout — Sample Targets
+# One IP or domain per line. Lines starting with # are ignored.
+
+# Public IPs
+8.8.8.8
+1.1.1.1
+
+# Domains
+google.com
+github.com
