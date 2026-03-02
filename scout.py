@@ -41,8 +41,8 @@ CENSYS_BASE = "https://search.censys.io/api/v2"
 HT_BASE     = "https://api.hackertarget.com"
 
 # ── Patterns ───────────────────────────────────────────────────────────────────
-RE_IPV4   = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
-RE_DOMAIN = re.compile(r"^(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$")
+RE_IPV4   = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)$")
+RE_DOMAIN = re.compile(r"^(?:[a-zA-Z0-9_-]+\.)+[a-zA-Z]{2,}$")
 
 # ── Risk config ────────────────────────────────────────────────────────────────
 RISK_COLORS = {
@@ -53,14 +53,12 @@ RISK_COLORS = {
     "INFO":     "cyan",
 }
 
-# Ports that indicate significant exposure
+# Ports that indicate significant exposure (HTTP/HTTPS excluded — normal for web servers)
 HIGH_RISK_PORTS: Dict[int, str] = {
     21:    "FTP",
     22:    "SSH",
     23:    "Telnet",
     25:    "SMTP",
-    80:    "HTTP",
-    443:   "HTTPS",
     445:   "SMB",
     1433:  "MSSQL",
     3306:  "MySQL",
@@ -68,15 +66,13 @@ HIGH_RISK_PORTS: Dict[int, str] = {
     5432:  "PostgreSQL",
     5900:  "VNC",
     6379:  "Redis",
-    8080:  "HTTP-Alt",
-    8443:  "HTTPS-Alt",
     9200:  "Elasticsearch",
     9300:  "Elasticsearch (cluster)",
     27017: "MongoDB",
     28017: "MongoDB (web)",
 }
 
-# Extra weight — these are almost always dangerous if exposed
+# Extra weight — almost always dangerous if internet-exposed
 CRITICAL_PORTS = {23, 445, 3389, 5900, 6379, 9200, 27017}
 
 
@@ -215,9 +211,12 @@ class HackerTargetClient:
         params = {"q": q}
         if self.key:
             params["apikey"] = self.key
-        r = self.s.get(f"{HT_BASE}/{endpoint}/", params=params, timeout=25)
+        r = self.s.get(f"{HT_BASE}/{endpoint}/", params=params, timeout=30)
         r.raise_for_status()
-        return r.text.strip()
+        text = r.text.strip()
+        if text.startswith("error"):
+            raise RuntimeError(text)
+        return text
 
     def geoip(self, q):       return self._get("geoip", q)
     def reversedns(self, q):  return self._get("reversedns", q)
@@ -238,71 +237,59 @@ def parse_hackertarget(target: str, target_type: str, ht: HackerTargetClient) ->
         "whois_info":   {},
     }
 
+    def _ht_call(fn, *args):
+        """Run a HackerTarget call, return result or None on error."""
+        try:
+            val = fn(*args)
+            time.sleep(0.5)
+            return val
+        except Exception as e:
+            console.print(f"[dim]  HackerTarget/{fn.__name__}: {e}[/dim]", stderr=True)
+            return None
+
     # ── GeoIP
-    try:
-        for line in ht.geoip(target).splitlines():
+    raw = _ht_call(ht.geoip, target)
+    if raw:
+        for line in raw.splitlines():
             if ":" in line:
                 k, _, v = line.partition(":")
                 result["geoip"][k.strip()] = v.strip()
-        time.sleep(0.4)
-    except Exception:
-        pass
 
-    # ── Reverse DNS (IP targets)
+    # ── Reverse DNS (IP targets only)
     if target_type == "ip":
-        try:
-            rdns = ht.reversedns(target)
-            if rdns and "error" not in rdns.lower():
-                result["reverse_dns"] = rdns.split()[-1]
-            time.sleep(0.4)
-        except Exception:
-            pass
+        raw = _ht_call(ht.reversedns, target)
+        if raw:
+            result["reverse_dns"] = raw.split()[-1]
 
-    # ── DNS records (domain targets)
+    # ── DNS records + subdomains (domain targets only)
     if target_type == "domain":
-        try:
-            dns_raw = ht.dnslookup(target)
-            result["dns_records"] = [
-                l for l in dns_raw.splitlines()
-                if l and "error" not in l.lower()
-            ][:12]
-            time.sleep(0.4)
-        except Exception:
-            pass
+        raw = _ht_call(ht.dnslookup, target)
+        if raw:
+            result["dns_records"] = [l for l in raw.splitlines() if l][:12]
 
-        # ── Subdomain/host search
-        try:
-            hs_raw = ht.hostsearch(target)
-            result["subdomains"] = [
-                l.split(",")[0] for l in hs_raw.splitlines()
-                if l and "error" not in l.lower()
-            ][:10]
-            time.sleep(0.4)
-        except Exception:
-            pass
+        raw = _ht_call(ht.hostsearch, target)
+        if raw:
+            result["subdomains"] = [l.split(",")[0] for l in raw.splitlines() if l][:10]
 
-    # ── Nmap port scan
-    try:
-        nmap_raw = ht.nmap(target)
-        ports = []
-        for line in nmap_raw.splitlines():
+    # ── Nmap port scan (must use resolved IP, not domain string)
+    nmap_target = result.get("_resolved_ip") or target
+    raw = _ht_call(ht.nmap, nmap_target)
+    if raw:
+        for line in raw.splitlines():
             m = re.search(r"(\d+)/(tcp|udp)\s+(\w+)\s*(.*)?", line)
             if m and m.group(3) == "open":
-                ports.append({
+                result["open_ports"].append({
                     "port":    int(m.group(1)),
                     "proto":   m.group(2),
                     "service": (m.group(4) or "").strip() or "unknown",
                 })
-        result["open_ports"] = ports[:15]
-        time.sleep(0.4)
-    except Exception:
-        pass
+        result["open_ports"] = result["open_ports"][:15]
 
     # ── Whois
-    try:
-        whois_raw = ht.whois(target)
+    raw = _ht_call(ht.whois, target)
+    if raw:
         info = {}
-        for line in whois_raw.splitlines():
+        for line in raw.splitlines():
             for field in ("Registrar", "Creation Date", "Expiry Date",
                           "Updated Date", "Name Server", "Registrant Org"):
                 if line.strip().lower().startswith(field.lower()) and ":" in line:
@@ -310,9 +297,6 @@ def parse_hackertarget(target: str, target_type: str, ht: HackerTargetClient) ->
                     if field not in info:
                         info[field] = v.strip()
         result["whois_info"] = info
-        time.sleep(0.4)
-    except Exception:
-        pass
 
     return result
 
@@ -399,6 +383,8 @@ class OSINTScout:
         # ── HackerTarget (no key required for basic queries)
         try:
             ht_data = parse_hackertarget(target, target_type, self.ht)
+            # Pass resolved IP so nmap uses it instead of the domain string
+            ht_data["_resolved_ip"] = ip if ip != target else None
             record["hackertarget"] = ht_data
             all_ports.extend(p["port"] for p in ht_data.get("open_ports", []))
         except Exception as e:
