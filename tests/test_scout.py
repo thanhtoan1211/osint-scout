@@ -1,8 +1,9 @@
 """
 OSINT Scout — Test Suite
 ========================
-Tests cover: classify, calc_risk, RateLimiter, ScanCache,
-all pure parsers, and OSINTScout.scan() with mocked HTTP.
+Tests cover: classify, calc_risk (incl. credential risk), RateLimiter,
+ScanCache, parse_shodan, parse_censys, parse_hackedlist, and
+OSINTScout.scan() with mocked HTTP.
 
 Run:
     pip install pytest
@@ -28,12 +29,11 @@ from scout import (
     ScanCache,
     parse_shodan,
     parse_censys,
-    parse_hackertarget_geoip,
-    parse_hackertarget_nmap,
-    parse_hackertarget_whois,
+    parse_hackedlist,
     OSINTScout,
     HIGH_RISK_PORTS,
     CRITICAL_PORTS,
+    CRED_EXPOSURE_THRESHOLDS,
 )
 
 
@@ -133,37 +133,67 @@ CENSYS_HOST = {
     }
 }
 
-HT_GEOIP_RAW = (
-    "IP: 8.8.8.8\n"
-    "Country: United States\n"
-    "State: California\n"
-    "City: Mountain View\n"
-    "Latitude: 37.3860\n"
-    "Longitude: -122.0838\n"
-    "ISP: Google LLC\n"
-)
+# HackedList fixtures
+HL_DOMAIN_CLEAN = {
+    "domain":        "safe-domain.com",
+    "total":         0,
+    "sources":       [],
+    "latest_breach": None,
+    "first_seen":    None,
+}
 
-HT_RDNS_RAW = "8.8.8.8 dns.google\n"
+HL_DOMAIN_LOW = {
+    "domain":        "small-org.com",
+    "total":         42,
+    "sources":       ["RedLine Stealer"],
+    "latest_breach": "2024-01-15",
+    "first_seen":    "2023-06-01",
+}
 
-HT_NMAP_RAW = (
-    "Starting Nmap scan...\n"
-    "PORT     STATE  SERVICE\n"
-    "53/tcp   open   domain\n"
-    "443/tcp  open   https\n"
-    "8080/tcp closed http-proxy\n"   # closed — should NOT be included
-    "22/tcp   open   ssh\n"
-)
+HL_DOMAIN_MEDIUM = {
+    "domain":        "example.com",
+    "total":         523,
+    "sources":       ["RedLine Stealer", "Vidar Stealer"],
+    "latest_breach": "2024-06-01",
+    "first_seen":    "2022-03-10",
+}
 
-HT_NMAP_EMPTY = "Starting Nmap scan...\nNmap done: 0 hosts up\n"
+HL_DOMAIN_CRITICAL = {
+    "domain":        "bigcorp.com",
+    "total":         15_000,
+    "sources":       ["RedLine Stealer", "Vidar", "Raccoon", "Aurora"],
+    "latest_breach": "2024-11-01",
+    "first_seen":    "2021-01-01",
+}
 
-HT_WHOIS_RAW = (
-    "Domain Name: GOOGLE.COM\n"
-    "Registrar: MarkMonitor Inc.\n"
-    "Updated Date: 2024-09-09T00:00:00Z\n"
-    "Creation Date: 1997-09-15T04:00:00Z\n"
-    "Expiry Date: 2028-09-14T04:00:00Z\n"
-    "Name Server: ns1.google.com\n"
-)
+HL_DOMAIN_ALT_FIELD = {
+    # Some API versions use "count" instead of "total"
+    "domain":     "alt.com",
+    "count":      200,
+    "infostealers": "Vidar, Aurora",   # comma-separated string variant
+    "last_seen":  "2024-09-01",
+}
+
+# Minimal HackedList mock return value for OSINTScout scan tests
+_HL_MOCK_CLEAN = {
+    "source":            "HackedList",
+    "domain":            "example.com",
+    "total_credentials": 0,
+    "sources":           [],
+    "latest_breach":     "N/A",
+    "first_seen":        "N/A",
+    "exposure_level":    "NONE",
+}
+
+_HL_MOCK_EXPOSED = {
+    "source":            "HackedList",
+    "domain":            "example.com",
+    "total_credentials": 1_500,
+    "sources":           ["RedLine Stealer"],
+    "latest_breach":     "2024-10-01",
+    "first_seen":        "2022-01-01",
+    "exposure_level":    "HIGH",
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -276,7 +306,7 @@ class TestCalcRisk:
         assert level == "MEDIUM"
 
     def test_mixed_critical_and_cves(self):
-        # 3389 (30) + 2 CVEs (50) = 80 → capped at 80 → CRITICAL
+        # 3389 (30) + 2 CVEs (50) = 80 → CRITICAL
         score, level = calc_risk([3389], ["CVE-2021-44228", "CVE-2022-0778"])
         assert score == 80
         assert level == "CRITICAL"
@@ -296,12 +326,55 @@ class TestCalcRisk:
 
     def test_level_boundaries(self):
         # Exact boundary checks
-        assert calc_risk([], [])[1]  == "INFO"       # 0
-        assert calc_risk([22], [])[1] == "LOW"        # 15
+        assert calc_risk([], [])[1]   == "INFO"   # 0
+        assert calc_risk([22], [])[1] == "LOW"    # 15
         # MEDIUM boundary: score 35
-        # 22 (15) + 8888 (3) * 6 + need 2 more = 22 (15) + 7 low ports (21) = 36
         score, level = calc_risk([22, 100, 101, 102, 103, 104, 105, 106], [])
         assert level == "MEDIUM"
+
+    # ── Credential exposure (cred_count parameter) ─────────────────────────────
+
+    def test_zero_credentials_no_extra_risk(self):
+        # Default cred_count=0 has no effect
+        score, level = calc_risk([], [], cred_count=0)
+        assert score == 0
+        assert level == "INFO"
+
+    def test_few_credentials_adds_low_risk(self):
+        # 1-99 credentials → +5
+        score, level = calc_risk([], [], cred_count=50)
+        assert score == 5
+        assert level == "INFO"
+
+    def test_medium_credential_exposure(self):
+        # 100-999 → +10
+        score, level = calc_risk([], [], cred_count=500)
+        assert score == 10
+        assert level == "LOW"
+
+    def test_high_credential_exposure(self):
+        # 1000-9999 → +20
+        score, level = calc_risk([], [], cred_count=5_000)
+        assert score == 20
+        assert level == "LOW"
+
+    def test_critical_credential_exposure(self):
+        # 10000+ → +30
+        score, level = calc_risk([], [], cred_count=15_000)
+        assert score == 30
+        assert level == "LOW"
+
+    def test_credentials_combined_with_ports_boosts_level(self):
+        # SSH(15) + 1000 creds(+20) = 35 → MEDIUM
+        score, level = calc_risk([22], [], cred_count=1_000)
+        assert score == 35
+        assert level == "MEDIUM"
+
+    def test_cred_count_cannot_exceed_100(self):
+        # Massive credentials + dangerous ports must stay capped
+        ports = list(CRITICAL_PORTS)
+        score, _ = calc_risk(ports, [], cred_count=50_000)
+        assert score == 100
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -450,9 +523,7 @@ class TestParseShodan:
 
     def test_services_extracted(self):
         result = parse_shodan(SHODAN_HOST_CLEAN)
-        # Should contain at least one service entry
         assert len(result["services"]) >= 1
-        # Service for port 443 should mention nginx
         assert any("nginx" in svc for svc in result["services"])
 
     def test_missing_fields_use_defaults(self):
@@ -464,9 +535,9 @@ class TestParseShodan:
         assert result["cves"]    == []
 
     def test_ports_sorted(self):
-        raw    = dict(SHODAN_HOST_CLEAN)
+        raw        = dict(SHODAN_HOST_CLEAN)
         raw["ports"] = [443, 22, 80, 8080]
-        result = parse_shodan(raw)
+        result     = parse_shodan(raw)
         assert result["ports"] == sorted(result["ports"])
 
     def test_source_field(self):
@@ -493,7 +564,6 @@ class TestParseCensys:
 
     def test_services_formatted(self):
         result = parse_censys(CENSYS_HOST)
-        # Should have an entry containing HTTPS
         assert any("HTTPS" in s for s in result["services"])
 
     def test_empty_response(self):
@@ -523,88 +593,88 @@ class TestParseCensys:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TestParseHackerTargetHelpers
+# TestParseHackedList
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestParseHackerTargetGeoip:
+class TestParseHackedList:
 
-    def test_parses_all_fields(self):
-        result = parse_hackertarget_geoip(HT_GEOIP_RAW)
-        assert result["Country"]   == "United States"
-        assert result["City"]      == "Mountain View"
-        assert result["Latitude"]  == "37.3860"
-        assert result["ISP"]       == "Google LLC"
+    def test_source_field(self):
+        assert parse_hackedlist({})["source"] == "HackedList"
 
-    def test_empty_string(self):
-        assert parse_hackertarget_geoip("") == {}
+    def test_clean_domain_zero_credentials(self):
+        result = parse_hackedlist(HL_DOMAIN_CLEAN)
+        assert result["total_credentials"] == 0
+        assert result["exposure_level"]    == "NONE"
 
-    def test_lines_without_colon_ignored(self):
-        raw    = "no colon here\nCountry: Germany\n"
-        result = parse_hackertarget_geoip(raw)
-        assert len(result) == 1
-        assert result["Country"] == "Germany"
+    def test_low_exposure(self):
+        result = parse_hackedlist(HL_DOMAIN_LOW)
+        assert result["total_credentials"] == 42
+        assert result["exposure_level"]    == "LOW"
 
+    def test_medium_exposure(self):
+        result = parse_hackedlist(HL_DOMAIN_MEDIUM)
+        assert result["total_credentials"] == 523
+        assert result["exposure_level"]    == "MEDIUM"
 
-class TestParseHackerTargetNmap:
+    def test_critical_exposure(self):
+        result = parse_hackedlist(HL_DOMAIN_CRITICAL)
+        assert result["total_credentials"] == 15_000
+        assert result["exposure_level"]    == "CRITICAL"
 
-    def test_open_ports_extracted(self):
-        result = parse_hackertarget_nmap(HT_NMAP_RAW)
-        ports  = [p["port"] for p in result]
-        assert 53   in ports
-        assert 443  in ports
-        assert 22   in ports
-        # closed port must NOT be included
-        assert 8080 not in ports
+    def test_sources_extracted(self):
+        result = parse_hackedlist(HL_DOMAIN_MEDIUM)
+        assert "RedLine Stealer" in result["sources"]
+        assert "Vidar Stealer"   in result["sources"]
 
-    def test_service_name_captured(self):
-        result = parse_hackertarget_nmap(HT_NMAP_RAW)
-        by_port = {p["port"]: p for p in result}
-        assert by_port[53]["service"]  == "domain"
-        assert by_port[443]["service"] == "https"
+    def test_breach_dates_extracted(self):
+        result = parse_hackedlist(HL_DOMAIN_MEDIUM)
+        assert result["latest_breach"] == "2024-06-01"
+        assert result["first_seen"]    == "2022-03-10"
 
-    def test_proto_captured(self):
-        result = parse_hackertarget_nmap(HT_NMAP_RAW)
-        for p in result:
-            assert p["proto"] in ("tcp", "udp")
+    def test_empty_response_defaults(self):
+        result = parse_hackedlist({})
+        assert result["total_credentials"] == 0
+        assert result["sources"]           == []
+        assert result["latest_breach"]     == "N/A"
+        assert result["first_seen"]        == "N/A"
+        assert result["exposure_level"]    == "NONE"
 
-    def test_empty_nmap_output(self):
-        assert parse_hackertarget_nmap(HT_NMAP_EMPTY) == []
+    def test_alt_field_names_count(self):
+        """API may return 'count' instead of 'total' — both must work."""
+        result = parse_hackedlist(HL_DOMAIN_ALT_FIELD)
+        assert result["total_credentials"] == 200
 
-    def test_max_15_ports(self):
-        lines = "\n".join(
-            f"{port}/tcp  open  svc" for port in range(1, 25)
-        )
-        result = parse_hackertarget_nmap(lines)
-        assert len(result) <= 15
+    def test_alt_field_infostealers_as_string(self):
+        """'infostealers' as a comma-separated string must be split."""
+        result = parse_hackedlist(HL_DOMAIN_ALT_FIELD)
+        assert "Vidar" in result["sources"]
+        assert "Aurora" in result["sources"]
 
-    def test_udp_ports_included(self):
-        raw    = "53/udp  open  domain\n"
-        result = parse_hackertarget_nmap(raw)
-        assert result[0]["proto"] == "udp"
+    def test_alt_field_last_seen(self):
+        """'last_seen' should fall back to 'latest_breach'."""
+        result = parse_hackedlist(HL_DOMAIN_ALT_FIELD)
+        assert result["latest_breach"] == "2024-09-01"
 
+    def test_none_breach_dates_normalised(self):
+        """None breach dates should become 'N/A'."""
+        result = parse_hackedlist(HL_DOMAIN_CLEAN)
+        assert result["latest_breach"] == "N/A"
+        assert result["first_seen"]    == "N/A"
 
-class TestParseHackerTargetWhois:
+    def test_sources_capped_at_ten(self):
+        """At most 10 sources should be returned."""
+        raw = {
+            "domain":  "example.com",
+            "total":   999,
+            "sources": [f"Stealer-{i}" for i in range(20)],
+        }
+        result = parse_hackedlist(raw)
+        assert len(result["sources"]) <= 10
 
-    def test_registrar_extracted(self):
-        result = parse_hackertarget_whois(HT_WHOIS_RAW)
-        assert "MarkMonitor" in result.get("Registrar", "")
-
-    def test_creation_date_extracted(self):
-        result = parse_hackertarget_whois(HT_WHOIS_RAW)
-        assert "1997" in result.get("Creation Date", "")
-
-    def test_expiry_date_extracted(self):
-        result = parse_hackertarget_whois(HT_WHOIS_RAW)
-        assert "2028" in result.get("Expiry Date", "")
-
-    def test_empty_whois(self):
-        assert parse_hackertarget_whois("") == {}
-
-    def test_no_duplicate_fields(self):
-        # First occurrence wins
-        raw    = "Registrar: First\nRegistrar: Second\n"
-        result = parse_hackertarget_whois(raw)
-        assert result["Registrar"] == "First"
+    def test_high_exposure_level(self):
+        raw = {"domain": "corp.com", "total": 1_500}
+        result = parse_hackedlist(raw)
+        assert result["exposure_level"] == "HIGH"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -615,10 +685,12 @@ def _make_scout(
     shodan_key="test-shodan",
     censys_id="test-id",
     censys_secret="test-secret",
-    ht_key=None,
+    hackedlist_key="test-hl-key",
 ) -> OSINTScout:
-    return OSINTScout(shodan_key, censys_id, censys_secret, ht_key,
-                      cache_ttl=300)
+    return OSINTScout(
+        shodan_key, censys_id, censys_secret, hackedlist_key,
+        cache_ttl=300,
+    )
 
 
 class TestOSINTScoutScan:
@@ -629,22 +701,12 @@ class TestOSINTScoutScan:
         assert result["type"]  == "unknown"
         assert "error" in result
 
-    def test_ip_scan_full_result(self):
-        """Full IP scan with all three sources returning mocked data."""
+    def test_ip_scan_shodan_and_censys_queried(self):
+        """Full IP scan: Shodan + Censys run; HackedList is skipped (IP target)."""
         scout = _make_scout()
-
-        # Patch the private query methods directly — no HTTP needed
-        scout._query_shodan       = MagicMock(return_value=parse_shodan(SHODAN_HOST_CLEAN))
-        scout._query_censys       = MagicMock(return_value=parse_censys(CENSYS_HOST))
-        scout._query_hackertarget = MagicMock(return_value={
-            "source":      "HackerTarget",
-            "reverse_dns": "dns.google",
-            "geoip":       {"Country": "US"},
-            "dns_records": [],
-            "subdomains":  [],
-            "open_ports":  [{"port": 53, "proto": "tcp", "service": "domain"}],
-            "whois_info":  {},
-        })
+        scout._query_shodan     = MagicMock(return_value=parse_shodan(SHODAN_HOST_CLEAN))
+        scout._query_censys     = MagicMock(return_value=parse_censys(CENSYS_HOST))
+        scout._query_hackedlist = MagicMock()
 
         result = scout.scan("8.8.8.8")
 
@@ -652,56 +714,72 @@ class TestOSINTScoutScan:
         assert result["type"]   == "ip"
         assert result["shodan"] is not None
         assert result["censys"] is not None
-        assert result["hackertarget"] is not None
+        assert result["hackedlist"] is None        # HackedList skipped for IPs
+        scout._query_hackedlist.assert_not_called()
         assert "score" in result["risk"]
         assert "level" in result["risk"]
         assert isinstance(result["summary"]["unique_ports"], list)
 
+    def test_hackedlist_queried_for_domain_target(self):
+        """HackedList should be queried when target is a domain."""
+        scout = _make_scout()
+        scout._resolve          = MagicMock(return_value="8.8.8.8")
+        scout._query_shodan     = MagicMock(return_value=parse_shodan(SHODAN_HOST_CLEAN))
+        scout._query_censys     = MagicMock(return_value=parse_censys(CENSYS_HOST))
+        scout._query_hackedlist = MagicMock(return_value=_HL_MOCK_CLEAN)
+
+        result = scout.scan("google.com")
+
+        scout._query_hackedlist.assert_called_once_with("google.com")
+        assert result["hackedlist"] is not None
+        assert result["hackedlist"]["source"] == "HackedList"
+
+    def test_hackedlist_skipped_for_ip_target(self):
+        """HackedList must NOT be called when scanning a plain IP address."""
+        scout = _make_scout()
+        scout._query_shodan     = MagicMock(return_value=parse_shodan(SHODAN_HOST_CLEAN))
+        scout._query_censys     = MagicMock(return_value=parse_censys(CENSYS_HOST))
+        scout._query_hackedlist = MagicMock()
+
+        result = scout.scan("1.2.3.4")
+
+        scout._query_hackedlist.assert_not_called()
+        assert result["hackedlist"] is None
+
     def test_source_failure_recorded_as_error(self):
         """A failing source should not crash the scan; error is captured."""
         scout = _make_scout()
-        scout._query_shodan       = MagicMock(side_effect=Exception("API key invalid"))
-        scout._query_censys       = MagicMock(return_value=parse_censys(CENSYS_HOST))
-        scout._query_hackertarget = MagicMock(return_value={
-            "source": "HackerTarget", "open_ports": [],
-            "geoip": {}, "dns_records": [], "subdomains": [],
-            "reverse_dns": "N/A", "whois_info": {},
-        })
+        scout._query_shodan     = MagicMock(side_effect=Exception("API key invalid"))
+        scout._query_censys     = MagicMock(return_value=parse_censys(CENSYS_HOST))
+        scout._query_hackedlist = MagicMock()
 
         result = scout.scan("8.8.8.8")
+
         assert "error" in result["shodan"]
         assert result["censys"] is not None   # other sources still work
 
     def test_cache_hit_skips_queries(self):
         """Second call for the same target must return cached data."""
         scout = _make_scout()
-        scout._query_shodan       = MagicMock(return_value=parse_shodan(SHODAN_HOST_CLEAN))
-        scout._query_censys       = MagicMock(return_value=parse_censys(CENSYS_HOST))
-        scout._query_hackertarget = MagicMock(return_value={
-            "source": "HackerTarget", "open_ports": [], "geoip": {},
-            "dns_records": [], "subdomains": [], "reverse_dns": "N/A",
-            "whois_info": {},
-        })
+        scout._query_shodan     = MagicMock(return_value=parse_shodan(SHODAN_HOST_CLEAN))
+        scout._query_censys     = MagicMock(return_value=parse_censys(CENSYS_HOST))
+        scout._query_hackedlist = MagicMock(return_value=_HL_MOCK_CLEAN)
 
-        scout.scan("1.1.1.1")
-        scout.scan("1.1.1.1")   # second call — should be a cache hit
+        scout.scan("example.com")
+        scout.scan("example.com")   # second call — should be a cache hit
 
         # Each query method should only have been called once
-        assert scout._query_shodan.call_count       == 1
-        assert scout._query_censys.call_count       == 1
-        assert scout._query_hackertarget.call_count == 1
+        assert scout._query_shodan.call_count     == 1
+        assert scout._query_censys.call_count     == 1
+        assert scout._query_hackedlist.call_count == 1
 
     def test_domain_resolves_before_querying(self):
         """Domain targets should be resolved to IP before Shodan/Censys calls."""
         scout = _make_scout()
-        scout._resolve = MagicMock(return_value="8.8.8.8")
-        scout._query_shodan       = MagicMock(return_value=parse_shodan(SHODAN_HOST_CLEAN))
-        scout._query_censys       = MagicMock(return_value=parse_censys(CENSYS_HOST))
-        scout._query_hackertarget = MagicMock(return_value={
-            "source": "HackerTarget", "open_ports": [], "geoip": {},
-            "dns_records": [], "subdomains": [], "reverse_dns": "N/A",
-            "whois_info": {},
-        })
+        scout._resolve          = MagicMock(return_value="8.8.8.8")
+        scout._query_shodan     = MagicMock(return_value=parse_shodan(SHODAN_HOST_CLEAN))
+        scout._query_censys     = MagicMock(return_value=parse_censys(CENSYS_HOST))
+        scout._query_hackedlist = MagicMock(return_value=_HL_MOCK_CLEAN)
 
         result = scout.scan("google.com")
 
@@ -711,15 +789,11 @@ class TestOSINTScoutScan:
     def test_risk_score_critical_for_dangerous_ports(self):
         """Scanning a host with RDP + Redis + 2 CVEs → CRITICAL risk."""
         scout = _make_scout()
-        scout._query_shodan = MagicMock(
+        scout._query_shodan     = MagicMock(
             return_value=parse_shodan(SHODAN_HOST_MALICIOUS)
         )
-        scout._query_censys       = MagicMock(return_value=parse_censys({}))
-        scout._query_hackertarget = MagicMock(return_value={
-            "source": "HackerTarget", "open_ports": [], "geoip": {},
-            "dns_records": [], "subdomains": [], "reverse_dns": "N/A",
-            "whois_info": {},
-        })
+        scout._query_censys     = MagicMock(return_value=parse_censys({}))
+        scout._query_hackedlist = MagicMock()
 
         result = scout.scan("185.220.101.45")
 
@@ -729,43 +803,61 @@ class TestOSINTScoutScan:
         assert 6379 in result["summary"]["critical_ports"]
         assert "CVE-2021-44228" in result["summary"]["cves"]
 
-    def test_no_api_keys_still_runs_hackertarget(self):
-        """Without Shodan/Censys keys, HackerTarget alone should run."""
-        scout = OSINTScout(shodan_key=None, censys_id=None,
-                           censys_secret=None, cache_ttl=300)
-        scout._query_hackertarget = MagicMock(return_value={
-            "source":      "HackerTarget",
-            "open_ports":  [{"port": 22, "proto": "tcp", "service": "ssh"}],
-            "geoip":       {},
-            "dns_records": [],
-            "subdomains":  [],
-            "reverse_dns": "N/A",
-            "whois_info":  {},
-        })
+    def test_credential_exposure_boosts_risk_score(self):
+        """High credential count from HackedList should raise the risk score."""
+        scout = _make_scout()
+        scout._resolve          = MagicMock(return_value="93.184.216.34")
+        scout._query_shodan     = MagicMock(return_value=parse_shodan({}))
+        scout._query_censys     = MagicMock(return_value=parse_censys({}))
+        scout._query_hackedlist = MagicMock(return_value=_HL_MOCK_EXPOSED)
 
+        # _HL_MOCK_EXPOSED has total_credentials=1500 → +20 to score
+        result = scout.scan("example.com")
+
+        assert result["risk"]["score"] >= 20
+        assert result["summary"]["credential_exposure"] == 1_500
+
+    def test_no_api_keys_scan_completes_without_crash(self):
+        """Without any API keys, scan completes and returns a valid record."""
+        scout = OSINTScout(
+            shodan_key=None, censys_id=None,
+            censys_secret=None, hackedlist_key=None,
+            cache_ttl=300,
+        )
         result = scout.scan("1.2.3.4")
 
-        assert result["shodan"]  is None
-        assert result["censys"]  is None
-        assert result["hackertarget"] is not None
-        scout._query_hackertarget.assert_called_once()
+        assert result["shodan"]     is None
+        assert result["censys"]     is None
+        assert result["hackedlist"] is None
+        assert "score" in result["risk"]
+        assert result["risk"]["score"] == 0
 
     def test_duplicate_targets_deduplicated_via_cache(self):
-        """scanning same target twice = 1 API hit each source, 2 results."""
+        """Scanning same target twice = 1 API hit per source, 2 results."""
         scout = _make_scout()
-        scout._query_shodan       = MagicMock(return_value=parse_shodan(SHODAN_HOST_CLEAN))
-        scout._query_censys       = MagicMock(return_value=parse_censys(CENSYS_HOST))
-        scout._query_hackertarget = MagicMock(return_value={
-            "source": "HackerTarget", "open_ports": [], "geoip": {},
-            "dns_records": [], "subdomains": [], "reverse_dns": "N/A",
-            "whois_info": {},
-        })
+        scout._resolve          = MagicMock(return_value="4.4.4.4")
+        scout._query_shodan     = MagicMock(return_value=parse_shodan(SHODAN_HOST_CLEAN))
+        scout._query_censys     = MagicMock(return_value=parse_censys(CENSYS_HOST))
+        scout._query_hackedlist = MagicMock(return_value=_HL_MOCK_CLEAN)
 
-        r1 = scout.scan("4.4.4.4")
-        r2 = scout.scan("4.4.4.4")  # cache hit
+        r1 = scout.scan("domain-a.com")
+        r2 = scout.scan("domain-a.com")   # cache hit
 
         assert r1 is r2   # identical dict objects from cache
-        assert scout._query_shodan.call_count == 1
+        assert scout._query_shodan.call_count     == 1
+        assert scout._query_hackedlist.call_count == 1
+
+    def test_summary_contains_credential_exposure_field(self):
+        """summary dict must always include 'credential_exposure' key."""
+        scout = _make_scout()
+        scout._query_shodan     = MagicMock(return_value=parse_shodan(SHODAN_HOST_CLEAN))
+        scout._query_censys     = MagicMock(return_value=parse_censys(CENSYS_HOST))
+        scout._query_hackedlist = MagicMock()
+
+        result = scout.scan("8.8.8.8")
+
+        assert "credential_exposure" in result["summary"]
+        assert result["summary"]["credential_exposure"] == 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════

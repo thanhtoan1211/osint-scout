@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-OSINT Scout — Enterprise Attack Surface Reconnaissance
-======================================================
-Concurrent intelligence from Shodan, Censys, and HackerTarget.
+OSINT Scout — Enterprise Attack Surface & Credential Exposure Reconnaissance
+=============================================================================
+Concurrent threat intelligence from Shodan, Censys, and HackedList.io.
+
+  • Shodan      — external attack surface (ports, services, CVEs)
+  • Censys      — secondary surface validation + TLS certificate intelligence
+  • HackedList  — darknet credential breach intelligence (infostealer dumps)
 
 Enterprise features:
   - Parallel source queries via ThreadPoolExecutor
@@ -23,6 +27,7 @@ import json
 import logging
 import os
 import re
+import socket
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -51,9 +56,9 @@ console = Console()
 log     = logging.getLogger("scout")
 
 # ── API base URLs ──────────────────────────────────────────────────────────────
-SHODAN_BASE = "https://api.shodan.io"
-CENSYS_BASE = "https://search.censys.io/api/v2"
-HT_BASE     = "https://api.hackertarget.com"
+SHODAN_BASE     = "https://api.shodan.io"
+CENSYS_BASE     = "https://search.censys.io/api/v2"
+HACKEDLIST_BASE = "https://api.hackedlist.io"
 
 # ── Patterns ───────────────────────────────────────────────────────────────────
 RE_IPV4   = re.compile(
@@ -93,6 +98,14 @@ HIGH_RISK_PORTS: Dict[int, str] = {
 # Extra risk weight — almost always dangerous if internet-exposed
 CRITICAL_PORTS = frozenset({23, 445, 3389, 5900, 6379, 9200, 27017})
 
+# Credential exposure thresholds — tiered by compromised account count
+CRED_EXPOSURE_THRESHOLDS: List[Tuple[int, str]] = [
+    (10_000, "CRITICAL"),
+    (1_000,  "HIGH"),
+    (100,    "MEDIUM"),
+    (1,      "LOW"),
+]
+
 
 # ── Pure helpers ───────────────────────────────────────────────────────────────
 
@@ -104,12 +117,37 @@ def classify(target: str) -> str:
     return "unknown"
 
 
-def calc_risk(ports: List[int], cves: List[str]) -> Tuple[int, str]:
-    """Return (score 0-100, level string) for a given set of ports and CVEs."""
+def calc_risk(
+    ports:      List[int],
+    cves:       List[str],
+    cred_count: int = 0,
+) -> Tuple[int, str]:
+    """
+    Return (score 0-100, level string) combining attack surface,
+    CVE severity, and credential breach exposure.
+
+    Scoring weights:
+      CRITICAL_PORT exposed  : +30 each
+      HIGH_RISK_PORT exposed : +15 each
+      Other open port        : +3  each
+      Known CVE              : +25 each
+      Credential exposure    : +5 / +10 / +20 / +30 (tiered by count)
+    """
     score = sum(
         30 if p in CRITICAL_PORTS else 15 if p in HIGH_RISK_PORTS else 3
         for p in ports
     ) + len(cves) * 25
+
+    # Tiered risk boost from compromised credential count (infostealer data)
+    if cred_count >= 10_000:
+        score += 30
+    elif cred_count >= 1_000:
+        score += 20
+    elif cred_count >= 100:
+        score += 10
+    elif cred_count > 0:
+        score += 5
+
     score = min(score, 100)
     level = (
         "CRITICAL" if score >= 80 else
@@ -356,121 +394,121 @@ def parse_censys(raw: Dict) -> Dict:
     }
 
 
-# ── HackerTarget ──────────────────────────────────────────────────────────────
+# ── HackedList.io ─────────────────────────────────────────────────────────────
 
-class HackerTargetClient:
+class HackedListClient:
     """
-    HackerTarget API client.
+    HackedList.io API client — darknet credential breach intelligence.
 
-    No key is required for the free tier (100 queries/day).
-    The rate limiter enforces 1 req/s to avoid triggering their throttle.
+    Queries the HackedList.io database (870M+ stolen credentials) for
+    accounts compromised by infostealer malware and exposed in darknet dumps
+    for a given domain.
+
+    Requires a paid API key with Bearer token authentication.
+    API docs: https://api.hackedlist.io  (Swagger UI)
+
+    Assumed endpoint: GET /v1/domain/{domain}
+    Expected response fields:
+        {
+          "domain":         "example.com",
+          "total":          1523,
+          "sources":        ["RedLine Stealer", "Vidar"],
+          "latest_breach":  "2024-06-01",
+          "first_seen":     "2022-03-10"
+        }
     """
 
-    _limiter = RateLimiter(calls_per_second=1.0)
+    _limiter = RateLimiter(calls_per_second=2.0)   # conservative for paid tier
 
-    def __init__(self, key: Optional[str] = None) -> None:
-        self.key = key
+    def __init__(self, api_key: str) -> None:
+        self.key = api_key
         self.s   = requests.Session()
-        self.s.headers["User-Agent"] = "osint-scout/2.0"
+        self.s.headers["User-Agent"]    = "osint-scout/2.0"
+        self.s.headers["Authorization"] = f"Bearer {api_key}"
 
-    @retry(max_attempts=2, base_delay=3.0)
-    def _get(self, endpoint: str, q: str) -> str:
+    @retry()
+    def domain(self, domain: str) -> Dict:
+        """Fetch credential breach intelligence for *domain*."""
         self._limiter.acquire()
-        params = {"q": q}
-        if self.key:
-            params["apikey"] = self.key
-        r = self.s.get(f"{HT_BASE}/{endpoint}/", params=params, timeout=30)
+        r = self.s.get(
+            f"{HACKEDLIST_BASE}/v1/domain/{domain}",
+            timeout=15,
+        )
         r.raise_for_status()
-        text = r.text.strip()
-        if text.lower().startswith("error"):
-            raise RuntimeError(f"HackerTarget: {text}")
-        return text
-
-    def geoip(self, q: str)      -> str: return self._get("geoip",      q)
-    def reversedns(self, q: str) -> str: return self._get("reversedns", q)
-    def dnslookup(self, q: str)  -> str: return self._get("dnslookup",  q)
-    def hostsearch(self, q: str) -> str: return self._get("hostsearch", q)
-    def nmap(self, q: str)       -> str: return self._get("nmap",       q)
-    def whois(self, q: str)      -> str: return self._get("whois",      q)
+        return r.json()
 
 
-# ── HackerTarget pure parsers (testable without network) ──────────────────────
+def parse_hackedlist(raw: Dict) -> Dict:
+    """
+    Parse a HackedList.io domain breach response into a normalised dict.
 
-def parse_hackertarget_geoip(raw: str) -> Dict[str, str]:
-    result: Dict[str, str] = {}
-    for line in raw.splitlines():
-        if ":" in line:
-            k, _, v = line.partition(":")
-            result[k.strip()] = v.strip()
-    return result
+    Handles both ``total`` and ``count`` field names for flexibility
+    across different API versions.
+    """
+    total = int(raw.get("total", raw.get("count", 0)) or 0)
 
+    sources = raw.get("sources", raw.get("infostealers", []))
+    if isinstance(sources, str):
+        sources = [s.strip() for s in sources.split(",") if s.strip()]
 
-def parse_hackertarget_nmap(raw: str) -> List[Dict]:
-    """Parse HackerTarget nmap plain-text output into a list of port dicts."""
-    ports: List[Dict] = []
-    for line in raw.splitlines():
-        # matches: "22/tcp  open  ssh" or "3389/tcp open  ms-wbt-server"
-        m = re.match(r"^(\d+)/(tcp|udp)\s+open\s+(\S*)", line.strip())
-        if m:
-            ports.append({
-                "port":    int(m.group(1)),
-                "proto":   m.group(2),
-                "service": m.group(3) or "unknown",
-            })
-    return ports[:15]
+    exposure_level = "NONE"
+    for threshold, level in CRED_EXPOSURE_THRESHOLDS:
+        if total >= threshold:
+            exposure_level = level
+            break
 
-
-def parse_hackertarget_whois(raw: str) -> Dict[str, str]:
-    info: Dict[str, str] = {}
-    for line in raw.splitlines():
-        for field in (
-            "Registrar", "Creation Date", "Expiry Date",
-            "Updated Date", "Name Server", "Registrant Org",
-        ):
-            if (
-                line.strip().lower().startswith(field.lower())
-                and ":" in line
-                and field not in info
-            ):
-                _, _, v = line.partition(":")
-                info[field] = v.strip()
-    return info
+    return {
+        "source":            "HackedList",
+        "domain":            raw.get("domain", "N/A"),
+        "total_credentials": total,
+        "sources":           list(sources)[:10],
+        "latest_breach":     raw.get("latest_breach") or raw.get("last_seen") or "N/A",
+        "first_seen":        raw.get("first_seen") or "N/A",
+        "exposure_level":    exposure_level,
+    }
 
 
 # ── Core scanner ───────────────────────────────────────────────────────────────
 
 class OSINTScout:
     """
-    Orchestrates parallel queries to Shodan, Censys, and HackerTarget,
-    aggregates port/CVE data, and computes an attack-surface risk score.
+    Orchestrates parallel queries to Shodan, Censys, and HackedList.io,
+    aggregates port/CVE/credential data, and computes a composite
+    attack-surface + credential-exposure risk score.
 
     Args:
-        shodan_key: Shodan API key (None → Shodan skipped).
-        censys_id / censys_secret: Censys API credentials (both required).
-        ht_key: HackerTarget API key (None → free-tier, 100 req/day).
-        cache_ttl: Seconds to cache results for the same target (default 300).
+        shodan_key:      Shodan API key (None → Shodan skipped).
+        censys_id:       Censys API ID (both ID and secret required).
+        censys_secret:   Censys API secret.
+        hackedlist_key:  HackedList.io Bearer API key (None → skipped).
+        cache_ttl:       Seconds to cache results for the same target (default 300).
     """
 
     def __init__(
         self,
-        shodan_key:    Optional[str] = None,
-        censys_id:     Optional[str] = None,
-        censys_secret: Optional[str] = None,
-        ht_key:        Optional[str] = None,
-        cache_ttl:     int = 300,
+        shodan_key:     Optional[str] = None,
+        censys_id:      Optional[str] = None,
+        censys_secret:  Optional[str] = None,
+        hackedlist_key: Optional[str] = None,
+        cache_ttl:      int = 300,
     ) -> None:
-        self.shodan = ShodanClient(shodan_key) if shodan_key else None
-        self.censys = (
+        self.shodan     = ShodanClient(shodan_key) if shodan_key else None
+        self.censys     = (
             CensysClient(censys_id, censys_secret)
             if (censys_id and censys_secret) else None
         )
-        self.ht     = HackerTargetClient(ht_key)
-        self._cache = ScanCache(ttl_seconds=cache_ttl)
+        self.hackedlist = HackedListClient(hackedlist_key) if hackedlist_key else None
+        self._cache     = ScanCache(ttl_seconds=cache_ttl)
 
     # ── Private helpers ────────────────────────────────────────────────────────
 
     def _resolve(self, domain: str) -> str:
-        """Resolve domain → IP via Shodan DNS, falling back to HackerTarget."""
+        """
+        Resolve domain → IP via Shodan DNS, falling back to the system resolver.
+
+        Using the system resolver as a fallback is faster and more reliable
+        than calling an external API, and consumes no API quota.
+        """
         if self.shodan:
             try:
                 ip = self.shodan.resolve(domain)
@@ -481,15 +519,11 @@ class OSINTScout:
                 log.debug("Shodan DNS failed: %s", exc)
 
         try:
-            raw = self.ht.dnslookup(domain)
-            for line in raw.splitlines():
-                m = re.search(r"\b((?:\d{1,3}\.){3}\d{1,3})\b", line)
-                if m:
-                    ip = m.group(1)
-                    log.debug("HackerTarget DNS: %s → %s", domain, ip)
-                    return ip
-        except Exception as exc:
-            log.debug("HackerTarget DNS failed: %s", exc)
+            ip = socket.gethostbyname(domain)
+            log.debug("System DNS: %s → %s", domain, ip)
+            return ip
+        except socket.gaierror as exc:
+            log.debug("System DNS failed: %s", exc)
 
         log.warning("Could not resolve %s — using as-is for queries", domain)
         return domain
@@ -500,68 +534,19 @@ class OSINTScout:
     def _query_censys(self, ip: str) -> Dict:
         return parse_censys(self.censys.host(ip))  # type: ignore[union-attr]
 
-    def _query_hackertarget(
-        self, domain_or_ip: str, ip: str, target_type: str
-    ) -> Dict:
-        result: Dict = {
-            "source":      "HackerTarget",
-            "reverse_dns": "N/A",
-            "geoip":       {},
-            "dns_records": [],
-            "subdomains":  [],
-            "open_ports":  [],
-            "whois_info":  {},
-        }
-
-        try:
-            result["geoip"] = parse_hackertarget_geoip(
-                self.ht.geoip(domain_or_ip)
-            )
-        except Exception as e:
-            log.debug("HT geoip: %s", e)
-
-        if target_type == "ip":
-            try:
-                rdns = self.ht.reversedns(ip)
-                result["reverse_dns"] = rdns.split()[-1] if rdns else "N/A"
-            except Exception as e:
-                log.debug("HT reversedns: %s", e)
-
-        if target_type == "domain":
-            try:
-                raw = self.ht.dnslookup(domain_or_ip)
-                result["dns_records"] = [l for l in raw.splitlines() if l][:12]
-            except Exception as e:
-                log.debug("HT dnslookup: %s", e)
-
-            try:
-                raw = self.ht.hostsearch(domain_or_ip)
-                result["subdomains"] = [
-                    l.split(",")[0] for l in raw.splitlines() if l
-                ][:10]
-            except Exception as e:
-                log.debug("HT hostsearch: %s", e)
-
-        # Nmap must use the resolved IP, not a domain string
-        try:
-            raw = self.ht.nmap(ip)
-            result["open_ports"] = parse_hackertarget_nmap(raw)
-        except Exception as e:
-            log.debug("HT nmap: %s", e)
-
-        try:
-            raw = self.ht.whois(domain_or_ip)
-            result["whois_info"] = parse_hackertarget_whois(raw)
-        except Exception as e:
-            log.debug("HT whois: %s", e)
-
-        return result
+    def _query_hackedlist(self, domain: str) -> Dict:
+        """Query HackedList.io for credential breach intelligence on *domain*."""
+        return parse_hackedlist(self.hackedlist.domain(domain))  # type: ignore[union-attr]
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def scan(self, target: str) -> Dict:
         """
         Run a full OSINT scan against *target* (IP or domain).
+
+        Shodan and Censys are queried for any resolvable target.
+        HackedList.io is queried for domain targets only (credential
+        breach intelligence is domain-specific).
 
         Sources are queried concurrently.  Results are cached for
         ``cache_ttl`` seconds so repeated calls don't waste API quota.
@@ -576,15 +561,15 @@ class OSINTScout:
 
         target_type = classify(target)
         record: Dict = {
-            "target":       target,
-            "type":         target_type,
-            "ip":           None,
-            "timestamp":    datetime.utcnow().isoformat() + "Z",
-            "shodan":       None,
-            "censys":       None,
-            "hackertarget": None,
-            "risk":         {},
-            "summary":      {},
+            "target":     target,
+            "type":       target_type,
+            "ip":         None,
+            "timestamp":  datetime.utcnow().isoformat() + "Z",
+            "shodan":     None,
+            "censys":     None,
+            "hackedlist": None,
+            "risk":       {},
+            "summary":    {},
         }
 
         if target_type == "unknown":
@@ -594,8 +579,9 @@ class OSINTScout:
         ip = self._resolve(target) if target_type == "domain" else target
         record["ip"] = ip if ip != target else None
 
-        all_ports: List[int] = []
-        all_cves:  List[str] = []
+        all_ports:  List[int] = []
+        all_cves:   List[str] = []
+        cred_count: int       = 0
 
         # ── Concurrent source queries ──────────────────────────────────────────
         task_map: Dict[str, object] = {}
@@ -604,9 +590,9 @@ class OSINTScout:
                 task_map["shodan"] = pool.submit(self._query_shodan, ip)
             if self.censys and ip:
                 task_map["censys"] = pool.submit(self._query_censys, ip)
-            task_map["hackertarget"] = pool.submit(
-                self._query_hackertarget, target, ip, target_type
-            )
+            # HackedList is domain-only (credential breach is keyed to email domain)
+            if self.hackedlist and target_type == "domain":
+                task_map["hackedlist"] = pool.submit(self._query_hackedlist, target)
 
             for key, future in task_map.items():  # type: ignore[assignment]
                 try:
@@ -617,10 +603,8 @@ class OSINTScout:
                         all_cves.extend(data.get("cves", []))
                     elif key == "censys":
                         all_ports.extend(data.get("ports", []))
-                    elif key == "hackertarget":
-                        all_ports.extend(
-                            p["port"] for p in data.get("open_ports", [])
-                        )
+                    elif key == "hackedlist":
+                        cred_count = data.get("total_credentials", 0)
                 except Exception as exc:
                     log.error("Source %s failed for %s: %s", key, target, exc)
                     record[key] = {"source": key.title(), "error": str(exc)}
@@ -628,15 +612,16 @@ class OSINTScout:
         # ── Risk scoring ───────────────────────────────────────────────────────
         unique_ports = sorted(set(all_ports))
         unique_cves  = sorted(set(all_cves))
-        score, level = calc_risk(unique_ports, unique_cves)
+        score, level = calc_risk(unique_ports, unique_cves, cred_count)
 
         record["risk"]    = {"score": score, "level": level}
         record["summary"] = {
-            "unique_ports":     unique_ports,
-            "total_open_ports": len(unique_ports),
-            "high_risk_ports":  [p for p in unique_ports if p in HIGH_RISK_PORTS],
-            "critical_ports":   [p for p in unique_ports if p in CRITICAL_PORTS],
-            "cves":             unique_cves,
+            "unique_ports":        unique_ports,
+            "total_open_ports":    len(unique_ports),
+            "high_risk_ports":     [p for p in unique_ports if p in HIGH_RISK_PORTS],
+            "critical_ports":      [p for p in unique_ports if p in CRITICAL_PORTS],
+            "cves":                unique_cves,
+            "credential_exposure": cred_count,
         }
 
         self._cache.put(target, record)
@@ -648,8 +633,8 @@ class OSINTScout:
 def print_banner() -> None:
     console.print(Panel(
         "[bold cyan]OSINT Scout[/bold cyan]  [dim]|[/dim]  "
-        "[dim]Attack Surface Reconnaissance[/dim]\n"
-        "[dim]Shodan  ·  Censys  ·  HackerTarget  |  Bui Thanh Toan[/dim]",
+        "[dim]Attack Surface & Credential Exposure Reconnaissance[/dim]\n"
+        "[dim]Shodan  ·  Censys  ·  HackedList.io  |  Bui Thanh Toan[/dim]",
         border_style="bright_blue",
         expand=False,
     ))
@@ -742,47 +727,44 @@ def render_censys(data: Optional[Dict]) -> Optional[Table]:
     return t
 
 
-def render_hackertarget(data: Optional[Dict]) -> Optional[Table]:
+def render_hackedlist(data: Optional[Dict]) -> Optional[Table]:
     if not data:
         return None
     if "error" in data:
-        t = _table("HackerTarget", "red")
+        t = _table("HackedList.io", "red")
         t.add_row("Error", data["error"])
         return t
 
-    t = _table("HackerTarget", "green")
-    geo = data.get("geoip", {})
+    level = data.get("exposure_level", "NONE")
+    color_map = {
+        "CRITICAL": "red",
+        "HIGH":     "orange1",
+        "MEDIUM":   "yellow",
+        "LOW":      "green",
+        "NONE":     "bright_blue",
+    }
+    color = color_map.get(level, "bright_blue")
 
-    t.add_row("Reverse DNS", data.get("reverse_dns", "N/A"))
-    if geo.get("Country"):
-        t.add_row("Country", geo["Country"])
-    if geo.get("City"):
-        t.add_row("City", geo["City"])
-    if geo.get("Latitude"):
-        t.add_row("Lat / Lon",
-                  f"{geo.get('Latitude', '?')} / {geo.get('Longitude', '?')}")
-    if geo.get("ISP"):
-        t.add_row("ISP", geo["ISP"])
-    if data.get("dns_records"):
-        t.add_row("DNS Records", "\n".join(data["dns_records"]))
-    if data.get("subdomains"):
-        t.add_row("Subdomains", "\n".join(data["subdomains"]))
+    t = _table("HackedList.io — Credential Intelligence", color)
+    t.add_row("Domain", data.get("domain", "N/A"))
 
-    ports = data.get("open_ports", [])
-    if ports:
-        t.add_row(
-            "Open Ports",
-            Text(
-                "\n".join(f":{p['port']}/{p['proto']}  {p['service']}"
-                          for p in ports),
-                style="yellow",
-            ),
-        )
+    total = data.get("total_credentials", 0)
+    t.add_row(
+        "Compromised Creds",
+        Text(
+            f"{total:,}" if total else "None found",
+            style=f"bold {color}" if total else "green",
+        ),
+    )
+    t.add_row("Exposure Level", Text(level, style=f"bold {color}"))
 
-    for field in ("Registrar", "Registrant Org", "Creation Date",
-                  "Expiry Date", "Name Server"):
-        if data.get("whois_info", {}).get(field):
-            t.add_row(field, data["whois_info"][field])
+    if data.get("sources"):
+        t.add_row("Infostealer Sources", "\n".join(data["sources"]))
+
+    if data.get("latest_breach") and data["latest_breach"] != "N/A":
+        t.add_row("Latest Breach", data["latest_breach"])
+    if data.get("first_seen") and data["first_seen"] != "N/A":
+        t.add_row("First Seen", data["first_seen"])
 
     return t
 
@@ -798,6 +780,7 @@ def render_risk(risk: Dict, summary: Dict) -> None:
     high  = [p for p in summary.get("high_risk_ports", []) if p not in crit]
     cves  = summary.get("cves", [])
     total = summary.get("total_open_ports", 0)
+    creds = summary.get("credential_exposure", 0)
 
     content = Text()
     content.append("  Score   :  ", style="bold white")
@@ -807,6 +790,12 @@ def render_risk(risk: Dict, summary: Dict) -> None:
     content.append("  Ports   :  ", style="bold white")
     content.append(f"{total} open\n")
 
+    if creds:
+        content.append("  Creds   :  ", style="bold white")
+        content.append(
+            f"{creds:,} compromised credentials (infostealer data)\n",
+            style="bold red",
+        )
     if crit:
         content.append("  Critical:  ", style="bold white")
         content.append(
@@ -857,9 +846,9 @@ def render_record(rec: Dict) -> None:
         return
 
     for fn, key in [
-        (render_shodan,       "shodan"),
-        (render_censys,       "censys"),
-        (render_hackertarget, "hackertarget"),
+        (render_shodan,     "shodan"),
+        (render_censys,     "censys"),
+        (render_hackedlist, "hackedlist"),
     ]:
         tbl = fn(rec.get(key))
         if tbl:
@@ -887,7 +876,7 @@ def setup_logging(verbose: bool = False) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(
         prog="scout",
-        description="OSINT Scout — Shodan + Censys + HackerTarget recon tool",
+        description="OSINT Scout — Shodan + Censys + HackedList.io recon tool",
         epilog=(
             "Examples:\n"
             "  python scout.py -t 8.8.8.8\n"
@@ -913,10 +902,10 @@ def main() -> None:
     if not args.no_banner:
         print_banner()
 
-    shodan_key    = os.getenv("SHODAN_API_KEY")
-    censys_id     = os.getenv("CENSYS_API_ID")
-    censys_secret = os.getenv("CENSYS_API_SECRET")
-    ht_key        = os.getenv("HACKERTARGET_API_KEY")
+    shodan_key     = os.getenv("SHODAN_API_KEY")
+    censys_id      = os.getenv("CENSYS_API_ID")
+    censys_secret  = os.getenv("CENSYS_API_SECRET")
+    hackedlist_key = os.getenv("HACKEDLIST_API_KEY")
 
     if not shodan_key:
         console.print(
@@ -927,12 +916,13 @@ def main() -> None:
             "[yellow]CENSYS_API_ID / CENSYS_API_SECRET not set — "
             "Censys checks skipped.[/yellow]"
         )
-    console.print(
-        "[dim]HackerTarget: free tier active "
-        "(100 queries/day without API key)[/dim]\n"
-    )
+    if not hackedlist_key:
+        console.print(
+            "[yellow]HACKEDLIST_API_KEY not set — credential breach checks skipped.[/yellow]"
+        )
+    console.print()
 
-    scout = OSINTScout(shodan_key, censys_id, censys_secret, ht_key)
+    scout = OSINTScout(shodan_key, censys_id, censys_secret, hackedlist_key)
 
     targets: List[str] = []
     if args.target:
